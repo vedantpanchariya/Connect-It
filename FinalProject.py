@@ -6,20 +6,25 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 
-BUFFER_SIZE = 1024 * 1024  # 1MB for faster transfer
-PORT = 5001  # Port for file transfer
-filename = None
+BUFFER_SIZE = 1024 * 1024
+PORT = 5001
+selected_files = []
 
-# Function to Get Sender's IP Address
 def get_sender_ip():
     return socket.gethostbyname(socket.gethostname())
 
-# Function to Select File and Send
-def send_file():
-    global filename
-    filename = filedialog.askopenfilename()
-    if not filename:
-        messagebox.showerror("Error", "No file selected!")
+def get_file_hash(filepath):
+    hasher = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while chunk := f.read(BUFFER_SIZE):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def send_files():
+    global selected_files
+    selected_files = filedialog.askopenfilenames()
+    if not selected_files:
+        messagebox.showerror("Error", "No files selected!")
         return
 
     try:
@@ -34,35 +39,40 @@ def send_file():
         client, addr = sock.accept()
         messagebox.showinfo("Connected", f"Connected to {addr}")
 
-        file_size = os.path.getsize(filename)
-        file_hash = get_file_hash(filename)
+        # Send number of files
+        client.sendall(str(len(selected_files)).encode('utf-8'))
+        client.recv(16)  # ACK
 
-        metadata = f"{os.path.basename(filename)}|{file_size}|{file_hash}"
-        client.sendall(metadata.encode('utf-8'))
+        for file_path in selected_files:
+            file_size = os.path.getsize(file_path)
+            file_hash = get_file_hash(file_path)
+            file_name = os.path.basename(file_path)
+            metadata = f"{file_name}|{file_size}|{file_hash}"
+            client.sendall(metadata.encode('utf-8'))
+            client.recv(16)  # ACK
 
-        progress_bar["maximum"] = file_size
-        progress_bar["value"] = 0
-        progress_label.config(text="Sending...")
+            progress_bar["maximum"] = file_size
+            progress_bar["value"] = 0
+            progress_label.config(text=f"Sending: {file_name}")
 
-        sent_bytes = 0
-        with open(filename, "rb") as file:
-            while True:
-                data = file.read(BUFFER_SIZE)
-                if not data:
-                    break
-                client.sendall(data)
-                sent_bytes += len(data)
-                progress_bar["value"] = sent_bytes
-                root.update_idletasks()
+            sent_bytes = 0
+            with open(file_path, "rb") as file:
+                while True:
+                    data = file.read(BUFFER_SIZE)
+                    if not data:
+                        break
+                    client.sendall(data)
+                    sent_bytes += len(data)
+                    progress_bar["value"] = sent_bytes
+                    root.update_idletasks()
 
-        progress_label.config(text="File Sent Successfully!")
-        messagebox.showinfo("Success", "File Sent Successfully!")
+        progress_label.config(text="All Files Sent Successfully!")
+        messagebox.showinfo("Success", "All Files Sent Successfully!")
         sock.close()
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to send file: {e}")
+        messagebox.showerror("Error", f"Failed to send files: {e}")
 
-# Function to Receive File
-def receive_file():
+def receive_files():
     try:
         receiver_ip = server_ip_entry.get().strip()
         if not receiver_ip:
@@ -72,89 +82,69 @@ def receive_file():
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((receiver_ip, PORT))
 
-        metadata = sock.recv(1024).decode('utf-8', errors="ignore").strip()
-        file_info = metadata.split("|")
-        if len(file_info) != 3:
-            raise ValueError("Invalid File metadata received!")
-
-        filename, file_size, file_hash = file_info
-        file_size = file_size.strip()
-
-        if not file_size.isdigit():
-            raise ValueError(f"Invalid File Size received:'{file_size}'")
-
-        file_size = int(file_size)
+        file_count = int(sock.recv(16).decode('utf-8'))
+        sock.sendall(b'ACK')
 
         save_path = filedialog.askdirectory()
         if not save_path:
             messagebox.showerror("Error", "No folder selected!")
             return
 
-        full_path = os.path.join(save_path, filename)
+        for _ in range(file_count):
+            metadata = sock.recv(1024).decode('utf-8', errors="ignore").strip()
+            sock.sendall(b'ACK')
 
-        progress_bar["maximum"] = file_size
-        progress_bar["value"] = 0
-        progress_label.config(text="Receiving...")
+            file_name, file_size, file_hash = metadata.split("|")
+            file_size = int(file_size.strip())
+            full_path = os.path.join(save_path, file_name)
 
-        received_bytes = 0
-        with open(full_path, "wb") as file:
-            while received_bytes < file_size:
-                data = sock.recv(BUFFER_SIZE)
-                if not data:
-                    break
-                file.write(data)
-                received_bytes += len(data)
-                progress_bar["value"] = received_bytes
-                root.update_idletasks()
+            progress_bar["maximum"] = file_size
+            progress_bar["value"] = 0
+            progress_label.config(text=f"Receiving: {file_name}")
 
-        received_file_hash = get_file_hash(full_path)
-        if received_file_hash == file_hash:
-            progress_label.config(text="File Received Successfully!")
-            messagebox.showinfo("Success", "File Received Successfully!")
-        else:
-            progress_label.config(text="File Corrupted")
-            messagebox.showerror("Error", "File Transfer Failed: Corrupted Data")
+            received_bytes = 0
+            with open(full_path, "wb") as file:
+                while received_bytes < file_size:
+                    data = sock.recv(min(BUFFER_SIZE, file_size - received_bytes))
+                    if not data:
+                        break
+                    file.write(data)
+                    received_bytes += len(data)
+                    progress_bar["value"] = received_bytes
+                    root.update_idletasks()
 
+            if get_file_hash(full_path) != file_hash:
+                progress_label.config(text=f"{file_name} - Corrupted!")
+                messagebox.showerror("Error", f"File '{file_name}' corrupted!")
+                return
+
+        progress_label.config(text="All Files Received Successfully!")
+        messagebox.showinfo("Success", "All Files Received Successfully!")
         sock.close()
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to receive file: {e}")
+        messagebox.showerror("Error", f"Failed to receive files: {e}")
 
-# Function to Get File Hash
-def get_file_hash(filepath):
-    hasher = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        while chunk := f.read(BUFFER_SIZE):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+def send_thread():
+    threading.Thread(target=send_files, daemon=True).start()
 
-# Function to Run Send and Receive in Threads
-def send_file_thread():
-    threading.Thread(target=send_file, daemon=True).start()
+def receive_thread():
+    threading.Thread(target=receive_files, daemon=True).start()
 
-def receive_file_thread():
-    threading.Thread(target=receive_file, daemon=True).start()
-
-# Initialize Main Window
+# === UI ===
 root = tk.Tk()
-root.title("File Transfer (Windows)")
+root.title("CONNECT IT")
 root.geometry("500x550")
 root.configure(bg="#ecf0f1")
 root.resizable(False, False)
 
-# UI Components
-title_label = tk.Label(root, text="CONNECT IT", font=("Arial", 18, "bold"), bg="#ecf0f1", fg="#2c3e50")
-title_label.pack(pady=15)
-
-# Display Sender's IP
+tk.Label(root, text="CONNECT IT", font=("Arial", 18, "bold"), bg="#ecf0f1", fg="#2c3e50").pack(pady=15)
 sender_ip_label = tk.Label(root, text=f"Your IP: {get_sender_ip()}", font=("Arial", 10, "bold"), bg="#ecf0f1", fg="black")
 sender_ip_label.pack(pady=10)
 
-# Frame to Hold Buttons Side by Side
-button_frame = tk.Frame(root, bg="#ecf0f1")
-button_frame.pack(pady=10)
+frame = tk.Frame(root, bg="#ecf0f1")
+frame.pack(pady=10)
 
-# Styling for Rounded Buttons
-button_style = {
+style = {
     "font": ("Arial", 12, "bold"),
     "fg": "white",
     "padx": 15,
@@ -164,25 +154,14 @@ button_style = {
     "width": 10
 }
 
-send_btn = tk.Button(button_frame, text="📤 Send", command=send_file_thread, bg="#2ecc71", **button_style)
-send_btn.grid(row=0, column=0, padx=15, pady=5)
+tk.Button(frame, text="📤 Send", command=send_thread, bg="#2ecc71", **style).grid(row=0, column=0, padx=15, pady=5)
+tk.Button(frame, text="📥 Receive", command=receive_thread, bg="#e74c3c", **style).grid(row=0, column=1, padx=15, pady=5)
 
-receive_btn = tk.Button(button_frame, text="📥 Receive", command=receive_file_thread, bg="#e74c3c", **button_style)
-receive_btn.grid(row=0, column=1, padx=15, pady=5)
-
-# Move "No file selected" text below Send button
-file_label = tk.Label(root, text="No file selected", font=("Arial", 10), bg="#ecf0f1", fg="black")
-file_label.pack(pady=5)
-
-# Receiver Input Field
 tk.Label(root, text="Enter Sender IP:", font=("Arial", 10), bg="#ecf0f1").pack(pady=5)
 server_ip_entry = tk.Entry(root, width=30, font=("Arial", 10))
 server_ip_entry.pack(pady=5, ipady=4)
 
-# Progress Bar Styling
-style = ttk.Style()
-style.theme_use("clam")
-style.configure("TProgressbar", thickness=10, background="#3498db", troughcolor="#bdc3c7", borderwidth=1)
+ttk.Style().configure("TProgressbar", thickness=10, background="#3498db", troughcolor="#bdc3c7", borderwidth=1)
 
 progress_label = tk.Label(root, text="", font=("Arial", 10), bg="#ecf0f1")
 progress_label.pack(pady=5)
@@ -191,4 +170,3 @@ progress_bar = ttk.Progressbar(root, length=400, mode="determinate", style="TPro
 progress_bar.pack(pady=5)
 
 root.mainloop()
-
